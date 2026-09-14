@@ -13,6 +13,7 @@ import Blog from './pages/Blog';
 import AdminLogin from './pages/AdminLogin';
 import AdminDashboard from './pages/AdminDashboard';
 import ProductDetail from './pages/ProductDetail';
+import NotFound from './pages/NotFound';
 import PageTransition from './components/PageTransition';
 
 function App() {
@@ -112,6 +113,7 @@ function App() {
             <Route path="/contact" element={<Contact />} />
             <Route path="/admin/login" element={<AdminLogin />} />
             <Route path="/admin" element={<AdminDashboard />} />
+            <Route path="*" element={<NotFound />} />
           </Routes>
         </PageTransition>
       </div>

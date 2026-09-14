@@ -24,21 +24,23 @@ export default function AdminDashboard() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [search, setSearch] = useState('');
-  const [statusFilter, setStatusFilter] = useState('all');
+  const [page, setPage] = useState(1);
+  const [pagination, setPagination] = useState({ page: 1, limit: 25, total: 0, hasNextPage: false });
   const [selectedEnquiry, setSelectedEnquiry] = useState(null);
   const [updatingId, setUpdatingId] = useState(null);
 
   const navigate = useNavigate();
 
   useEffect(() => {
-    fetchEnquiries();
+    setPage(1);
+    fetchEnquiries(1);
   }, [statusFilter]);
 
   const getAuthToken = () => {
     return localStorage.getItem('admin_token');
   };
 
-  const fetchEnquiries = async () => {
+  const fetchEnquiries = async (targetPage = page) => {
     const token = getAuthToken();
     if (!token) {
       navigate('/admin/login');
@@ -49,7 +51,7 @@ export default function AdminDashboard() {
     setError('');
 
     try {
-      let url = `/api/enquiries?status=${statusFilter}`;
+      let url = `/api/enquiries?page=${targetPage}&limit=25&status=${statusFilter}`;
       if (search) {
         url += `&search=${encodeURIComponent(search)}`;
       }
@@ -66,13 +68,24 @@ export default function AdminDashboard() {
         return;
       }
 
+      if (response.status === 403) {
+        setError('Access Denied: Your account does not have administrator authorization. Please contact system admin.');
+        setEnquiries([]);
+        setLoading(false);
+        return;
+      }
+
       const result = await response.json();
 
       if (!response.ok || !result.success) {
-        throw new Error(result.error || 'Failed to fetch enquiries.');
+        throw new Error(result.message || 'Failed to fetch enquiries.');
       }
 
       setEnquiries(result.data || []);
+      if (result.pagination) {
+        setPagination(result.pagination);
+        setPage(result.pagination.page);
+      }
     } catch (err) {
       console.error('Fetch enquiries error:', err);
       setError(err.message || 'Error fetching enquiries from server.');
@@ -83,7 +96,14 @@ export default function AdminDashboard() {
 
   const handleSearchSubmit = (e) => {
     e.preventDefault();
-    fetchEnquiries();
+    setPage(1);
+    fetchEnquiries(1);
+  };
+
+  const handlePageChange = (newPage) => {
+    if (newPage < 1) return;
+    setPage(newPage);
+    fetchEnquiries(newPage);
   };
 
   const handleStatusChange = async (id, newStatus) => {
@@ -358,6 +378,33 @@ export default function AdminDashboard() {
                   ))}
                 </tbody>
               </table>
+            </div>
+          )}
+
+          {/* Pagination Controls */}
+          {pagination.total > 0 && (
+            <div style={{ padding: '14px 20px', borderTop: '1px solid #e2e8f0', display: 'flex', alignItems: 'center', justifyContent: 'space-between', backgroundColor: '#f8fafc', flexWrap: 'wrap', gap: '12px' }}>
+              <div style={{ fontSize: '0.85rem', color: '#64748b' }}>
+                Showing page <strong style={{ color: '#0f172a' }}>{page}</strong> of <strong style={{ color: '#0f172a' }}>{Math.max(1, Math.ceil(pagination.total / pagination.limit))}</strong> ({pagination.total} total enquiries)
+              </div>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={page <= 1 || loading}
+                  onClick={() => handlePageChange(page - 1)}
+                >
+                  ← Previous
+                </Button>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={!pagination.hasNextPage || loading}
+                  onClick={() => handlePageChange(page + 1)}
+                >
+                  Next →
+                </Button>
+              </div>
             </div>
           )}
         </div>

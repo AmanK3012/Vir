@@ -1,6 +1,9 @@
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import dotenv from 'dotenv';
+import { z } from 'zod';
 import { Resend } from 'resend';
 import { createClient } from '@supabase/supabase-js';
 
@@ -8,76 +11,261 @@ dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const isProduction = process.env.NODE_ENV === 'production';
 
-// Middleware
-app.use(cors());
-app.use(express.json());
+// ==========================================================
+// 1. Security Headers (Helmet with Custom CSP)
+// ==========================================================
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
+        imgSrc: [
+          "'self'",
+          "data:",
+          "blob:",
+          "https://images.unsplash.com"
+        ],
+        connectSrc: [
+          "'self'",
+          process.env.SUPABASE_URL ? process.env.SUPABASE_URL : ""
+        ].filter(Boolean),
+        frameSrc: ["'none'"],
+        objectSrc: ["'none'"],
+        upgradeInsecureRequests: isProduction ? [] : null
+      }
+    },
+    crossOriginEmbedderPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" }
+  })
+);
 
-// Initialize Clients
-const supabaseUrl = process.env.VITE_SUPABASE_URL || process.env.SUPABASE_URL;
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.VITE_SUPABASE_ANON_KEY;
+// ==========================================================
+// 2. Strict CORS Configuration
+// ==========================================================
+const configuredFrontend = process.env.FRONTEND_URL;
+const allowedOrigins = [
+  configuredFrontend,
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://127.0.0.1:5173'
+].filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      // Allow requests with no origin (like mobile apps, curl, or same-origin in production)
+      if (!origin || allowedOrigins.includes(origin) || (!isProduction && origin.includes('localhost'))) {
+        callback(null, true);
+      } else {
+        callback(new Error('CORS policy: Access from this origin is not allowed.'));
+      }
+    },
+    methods: ['GET', 'POST', 'PATCH'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true,
+    maxAge: 86400
+  })
+);
+
+// ==========================================================
+// 3. Body Size Limits
+// ==========================================================
+app.use(express.json({ limit: '32kb' }));
+app.use(express.urlencoded({ extended: true, limit: '32kb' }));
+
+// ==========================================================
+// 4. Rate Limiting
+// ==========================================================
+// Public submission rate limiter: 10 requests per 15 minutes per IP
+const enquiryLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    success: false,
+    message: 'Too many requests from this IP. Please try again later.'
+  }
+});
+
+// Admin endpoints rate limiter: 300 requests per 15 minutes per IP
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 300,
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+// ==========================================================
+// 5. Server-Side Supabase Client (Service Role Only)
+// ==========================================================
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 let supabase = null;
-if (supabaseUrl && supabaseKey && !supabaseUrl.includes('demo') && !supabaseUrl.includes('placeholder')) {
-  supabase = createClient(supabaseUrl, supabaseKey);
-  console.log('✅ Supabase initialized successfully');
+if (supabaseUrl && supabaseServiceRoleKey && !supabaseUrl.includes('placeholder')) {
+  supabase = createClient(supabaseUrl, supabaseServiceRoleKey, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false
+    }
+  });
+  console.log('✅ Supabase server client initialized with service-role security');
 } else {
-  console.warn('⚠️ Supabase credentials not set or using placeholders. Database ops will run in fallback mode.');
+  console.warn('⚠️ SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY not configured. Running in secure fallback mode.');
 }
 
+// ==========================================================
+// 6. Resend Email Client
+// ==========================================================
 const resendApiKey = process.env.RESEND_API_KEY;
 let resend = null;
-if (resendApiKey && resendApiKey.startsWith('re_') && !resendApiKey.includes('demo')) {
+if (resendApiKey && resendApiKey.startsWith('re_') && !resendApiKey.includes('placeholder')) {
   resend = new Resend(resendApiKey);
-  console.log('✅ Resend API initialized successfully');
+  console.log('✅ Resend API client initialized');
 } else {
-  console.warn('⚠️ RESEND_API_KEY not configured or invalid. Email sending will run in simulation mode.');
+  console.warn('⚠️ RESEND_API_KEY not configured. Email notifications running in mock mode.');
 }
 
 const TO_EMAIL = process.env.TO_EMAIL || 'sales@virpackaging.com';
 const FROM_EMAIL = process.env.FROM_EMAIL || 'Vir Engineers <onboarding@resend.dev>';
 
-// Auth Middleware for Admin Routes
+// ==========================================================
+// 7. Security Helpers (HTML Escaping & PostgREST Sanitizer)
+// ==========================================================
+const escapeHtml = (value = '') =>
+  String(value)
+    .replaceAll('&', '&amp;')
+    .replaceAll('<', '&lt;')
+    .replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;')
+    .replaceAll("'", '&#039;');
+
+const sanitizeSearchParam = (param = '') => {
+  // Strip control characters, quotes, commas, parentheses, and PostgREST operator tokens
+  return String(param)
+    .trim()
+    .slice(0, 100)
+    .replace(/[%,()":.\\]/g, '');
+};
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// ==========================================================
+// 8. Server-Side Zod Schemas
+// ==========================================================
+const enquirySchema = z.object({
+  fullName: z.string().trim().min(2, 'Full name is required').max(100),
+  companyName: z.string().trim().min(2, 'Company name is required').max(150),
+  email: z.string().trim().email('Invalid email address format').max(254),
+  phone: z.string().trim().min(7, 'Invalid phone number').max(20),
+  productInterest: z.string().trim().max(150).optional(),
+  productName: z.string().trim().max(150).optional(),
+  quantity: z.string().trim().max(100).optional(),
+  projectDetails: z.string().trim().max(5000).optional(),
+  message: z.string().trim().max(5000).optional(),
+  type: z.enum(['contact', 'quote']).default('contact')
+});
+
+// ==========================================================
+// 9. Admin Authentication & Authorization Middleware
+// ==========================================================
 const requireAdminAuth = async (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ success: false, error: 'Unauthorized: Missing token' });
-  }
-
-  const token = authHeader.split(' ')[1];
-
-  if (!supabase) {
-    // If Supabase is not configured yet, check for emergency dev admin token or fallback
-    if (token === 'dev_admin_session') {
-      req.user = { email: 'admin@virpackaging.com' };
-      return next();
-    }
-    return res.status(401).json({ success: false, error: 'Supabase server auth not configured' });
-  }
-
   try {
-    const { data: { user }, error } = await supabase.auth.getUser(token);
-    if (error || !user) {
-      return res.status(401).json({ success: false, error: 'Unauthorized: Invalid token' });
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized: Missing or malformed authentication token'
+      });
     }
+
+    const token = authHeader.split(' ')[1];
+    if (!token || token.length < 10) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized: Invalid token format'
+      });
+    }
+
+    if (!supabase) {
+      return res.status(503).json({
+        success: false,
+        message: 'Service unavailable: Authentication backend not initialized'
+      });
+    }
+
+    // Step 1: Verify user authentication with Supabase
+    const { data: { user }, error: authError } = await supabase.auth.getUser(token);
+    if (authError || !user) {
+      return res.status(401).json({
+        success: false,
+        message: 'Unauthorized: Invalid or expired token'
+      });
+    }
+
+    // Step 2: Verify role authorization in admin_users table
+    const { data: adminProfile, error: dbError } = await supabase
+      .from('admin_users')
+      .select('user_id, role, active')
+      .eq('user_id', user.id)
+      .eq('active', true)
+      .maybeSingle();
+
+    if (dbError) {
+      console.error('❌ Error verifying admin role in admin_users:', dbError.message);
+      return res.status(500).json({
+        success: false,
+        message: 'Internal authorization error'
+      });
+    }
+
+    if (!adminProfile || !['admin', 'manager'].includes(adminProfile.role)) {
+      return res.status(403).json({
+        success: false,
+        message: 'Forbidden: Insufficient administrative privileges'
+      });
+    }
+
+    // Attach verified user and admin profile to request
     req.user = user;
+    req.admin = adminProfile;
     next();
   } catch (err) {
-    return res.status(401).json({ success: false, error: 'Authentication error' });
+    console.error('❌ Exception in requireAdminAuth middleware:', err);
+    return res.status(401).json({
+      success: false,
+      message: 'Authentication failed'
+    });
   }
 };
+
+// ==========================================================
+// 10. API Routes
+// ==========================================================
 
 // Root Endpoint
 app.get('/', (req, res) => {
   res.json({
-    message: '🚀 Vir Engineers Backend API Server is running',
-    health: '/api/health',
+    name: 'Vir Engineers API',
     status: 'online'
   });
 });
 
-// 1. Health Check
+// Generic Public Health Check (Does NOT leak infrastructure details)
 app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok'
+  });
+});
+
+// Protected Internal Diagnostic Health Check
+app.get('/api/admin/health', requireAdminAuth, (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
@@ -88,75 +276,60 @@ app.get('/api/health', (req, res) => {
   });
 });
 
-// 2. Send Email & Save Enquiry (POST /api/send-email)
-app.post('/api/send-email', async (req, res) => {
+// Public Customer Enquiry Submission (Rate-Limited, Validated, Escaped)
+app.post('/api/send-email', enquiryLimiter, async (req, res) => {
   try {
-    const {
-      fullName,
-      companyName,
-      email,
-      phone,
-      productInterest,
-      productName,
-      projectDetails,
-      message,
-      quantity,
-      type = 'contact'
-    } = req.body;
-
-    const interest = productInterest || productName || 'General Inquiry';
-    const detailText = projectDetails || message || 'No additional details provided.';
-
-    // Server-side validation
-    if (!fullName || !companyName || !email || !phone) {
+    // 1. Validate request payload against backend Zod schema
+    const parseResult = enquirySchema.safeParse(req.body);
+    if (!parseResult.success) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: Full Name, Company Name, Email, and Phone are required.'
+        message: 'Invalid request data. Please check required fields.'
       });
     }
 
-    let savedEnquiry = null;
+    const validated = parseResult.data;
+    const interest = validated.productInterest || validated.productName || 'General Inquiry';
+    const detailText = validated.projectDetails || validated.message || 'No additional details provided.';
 
-    // A. Save record into Supabase Database if configured
+    // 2. Explicit construction of database insert object (prevents field manipulation)
     if (supabase) {
-      const { data, error } = await supabase
-        .from('enquiries')
-        .insert([
-          {
-            full_name: fullName,
-            company_name: companyName,
-            email: email,
-            phone: phone,
-            product_interest: interest,
-            quantity: quantity || null,
-            message: detailText,
-            status: 'pending',
-            type: type
-          }
-        ])
-        .select()
-        .single();
+      const enquiryRecord = {
+        full_name: validated.fullName,
+        company_name: validated.companyName,
+        email: validated.email,
+        phone: validated.phone,
+        product_interest: interest,
+        quantity: validated.quantity || null,
+        message: detailText,
+        status: 'pending',
+        type: validated.type
+      };
 
-      if (error) {
-        console.error('❌ Error inserting enquiry into Supabase:', error.message);
-      } else {
-        savedEnquiry = data;
-        console.log('💾 Saved enquiry to Supabase DB:', data.id);
+      const { error: insertError } = await supabase
+        .from('enquiries')
+        .insert([enquiryRecord]);
+
+      if (insertError) {
+        console.error('❌ Error inserting customer enquiry into Supabase:', insertError.message);
       }
-    } else {
-      console.log('ℹ️ Mock Saved Enquiry (Supabase unconfigured):', { fullName, email, interest });
     }
 
-    // B. Send Admin Notification Email via Resend
-    let resendResult = null;
-    let customerResult = null;
-
+    // 3. Dispatch Notification Emails with HTML Escaping
     if (resend) {
       try {
+        const safeName = escapeHtml(validated.fullName);
+        const safeCompany = escapeHtml(validated.companyName);
+        const safeEmail = escapeHtml(validated.email);
+        const safePhone = escapeHtml(validated.phone);
+        const safeInterest = escapeHtml(interest);
+        const safeQuantity = validated.quantity ? escapeHtml(validated.quantity) : null;
+        const safeDetails = escapeHtml(detailText);
+
         const adminEmailHtml = `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px; background-color: #ffffff;">
             <div style="background-color: #1e293b; padding: 16px 24px; border-radius: 6px 6px 0 0;">
-              <h2 style="color: #ffffff; margin: 0; font-size: 20px;">New ${type === 'quote' ? 'Product Quote Request' : 'Contact Inquiry'}</h2>
+              <h2 style="color: #ffffff; margin: 0; font-size: 20px;">New ${validated.type === 'quote' ? 'Product Quote Request' : 'Contact Inquiry'}</h2>
               <p style="color: #8CC63F; margin: 4px 0 0 0; font-size: 14px; font-weight: bold;">VIR packaging / Vir Engineers</p>
             </div>
             
@@ -164,152 +337,187 @@ app.post('/api/send-email', async (req, res) => {
               <table style="width: 100%; border-collapse: collapse;">
                 <tr>
                   <td style="padding: 8px 0; font-weight: bold; width: 140px; color: #64748b;">Customer Name:</td>
-                  <td style="padding: 8px 0;">${fullName}</td>
+                  <td style="padding: 8px 0;">${safeName}</td>
                 </tr>
                 <tr>
                   <td style="padding: 8px 0; font-weight: bold; color: #64748b;">Company:</td>
-                  <td style="padding: 8px 0;">${companyName}</td>
+                  <td style="padding: 8px 0;">${safeCompany}</td>
                 </tr>
                 <tr>
                   <td style="padding: 8px 0; font-weight: bold; color: #64748b;">Email:</td>
-                  <td style="padding: 8px 0;"><a href="mailto:${email}" style="color: #0284c7;">${email}</a></td>
+                  <td style="padding: 8px 0;">${safeEmail}</td>
                 </tr>
                 <tr>
                   <td style="padding: 8px 0; font-weight: bold; color: #64748b;">Phone:</td>
-                  <td style="padding: 8px 0;"><a href="tel:${phone}" style="color: #0284c7;">${phone}</a></td>
+                  <td style="padding: 8px 0;">${safePhone}</td>
                 </tr>
                 <tr>
                   <td style="padding: 8px 0; font-weight: bold; color: #64748b;">Product/Category:</td>
-                  <td style="padding: 8px 0; font-weight: bold; color: #8CC63F;">${interest}</td>
+                  <td style="padding: 8px 0; font-weight: bold; color: #8CC63F;">${safeInterest}</td>
                 </tr>
-                ${quantity ? `
+                ${safeQuantity ? `
                 <tr>
                   <td style="padding: 8px 0; font-weight: bold; color: #64748b;">Quantity Required:</td>
-                  <td style="padding: 8px 0;">${quantity}</td>
+                  <td style="padding: 8px 0;">${safeQuantity}</td>
                 </tr>` : ''}
               </table>
               
               <div style="margin-top: 20px; padding: 16px; background-color: #f8fafc; border-left: 4px solid #8CC63F; border-radius: 4px;">
                 <h4 style="margin: 0 0 8px 0; color: #1e293b;">Requirements / Details:</h4>
-                <p style="margin: 0; color: #475569; white-space: pre-line;">${detailText}</p>
+                <p style="margin: 0; color: #475569; white-space: pre-line;">${safeDetails}</p>
               </div>
             </div>
             
             <div style="padding: 16px 24px; background-color: #f1f5f9; border-radius: 0 0 6px 6px; text-align: center; color: #64748b; font-size: 12px;">
-              Sent automatically from Vir Engineers Website Backend
+              Sent securely from Vir Engineers Web Platform
             </div>
           </div>
         `;
 
-        resendResult = await resend.emails.send({
+        await resend.emails.send({
           from: FROM_EMAIL,
           to: [TO_EMAIL],
-          subject: `New Lead: ${interest} - ${companyName}`,
-          html: adminEmailHtml
+          subject: `New Lead: ${safeInterest} - ${safeCompany}`,
+          html: adminEmailHtml,
+          text: `New Lead: ${validated.type}\nName: ${validated.fullName}\nCompany: ${validated.companyName}\nEmail: ${validated.email}\nPhone: ${validated.phone}\nInterest: ${interest}\nDetails:\n${detailText}`
         });
-        console.log('✉️ Resend notification email sent:', resendResult);
 
-        // Send confirmation to customer
+        // Customer confirmation receipt
         const customerEmailHtml = `
           <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; padding: 20px; border: 1px solid #e2e8f0; border-radius: 8px;">
             <h2 style="color: #1e293b;">Thank you for contacting Vir Engineers</h2>
-            <p>Dear ${fullName},</p>
-            <p>We have received your enquiry regarding <strong>${interest}</strong>.</p>
-            <p>Our technical team is reviewing your requirements and will reach out to you within 24 hours.</p>
+            <p>Dear ${safeName},</p>
+            <p>We have received your enquiry regarding <strong>${safeInterest}</strong>.</p>
+            <p>Our packaging engineering team is reviewing your requirement and will contact you within 24 hours.</p>
             <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 20px 0;" />
             <p style="font-size: 13px; color: #64748b;">
-              <strong>Vir Engineers / Vir Packaging</strong><br />
-              123 Industrial Estate, Phase II, Ahmedabad, Gujarat, India<br />
-              Phone: +91 98244 44481 | Email: sales@virpackaging.com
+              <strong>Vir Engineers — Your Preferred Packaging Partner</strong><br />
+              917, Maple Trade Centre, Thaltej, Ahmedabad, Gujarat - 380052<br />
+              Direct Lines: +91 89803 30315 / +91 98244 44481 | Email: sales@virpackaging.com
             </p>
           </div>
         `;
 
-        customerResult = await resend.emails.send({
+        await resend.emails.send({
           from: FROM_EMAIL,
-          to: [email],
-          subject: `We have received your enquiry - Vir Engineers`,
-          html: customerEmailHtml
+          to: [validated.email],
+          subject: `We have received your enquiry — Vir Engineers`,
+          html: customerEmailHtml,
+          text: `Dear ${validated.fullName},\n\nThank you for contacting Vir Engineers. We have received your enquiry regarding ${interest}. Our team will contact you within 24 hours.\n\nVir Engineers\nPhone: +91 89803 30315 / +91 98244 44481`
         });
-        console.log('✉️ Resend customer confirmation email sent:', customerResult);
       } catch (emailErr) {
-        console.error('❌ Resend email send error:', emailErr);
+        console.error('❌ Error sending email notification:', emailErr.message);
       }
-    } else {
-      console.log('ℹ️ Simulated Resend Email Sending (RESEND_API_KEY unconfigured).');
     }
 
+    // 4. Return safe generic response without exposing database metadata or customer PII
     return res.status(200).json({
       success: true,
-      message: 'Enquiry submitted successfully!',
-      data: savedEnquiry,
-      emailSent: Boolean(resendResult)
+      message: 'Enquiry submitted successfully'
     });
   } catch (err) {
     console.error('❌ Server POST /api/send-email error:', err);
     return res.status(500).json({
       success: false,
-      error: 'An internal server error occurred while processing your enquiry.'
+      message: 'An error occurred while submitting your enquiry. Please try again.'
     });
   }
 });
 
-// 3. Admin Get Enquiries (GET /api/enquiries) - Protected
-app.get('/api/enquiries', requireAdminAuth, async (req, res) => {
+// Admin: Paginated & Filtered Enquiries (Protected)
+app.get('/api/enquiries', adminLimiter, requireAdminAuth, async (req, res) => {
   try {
-    const { status, search } = req.query;
-
     if (!supabase) {
-      return res.status(500).json({
+      return res.status(503).json({
         success: false,
-        error: 'Supabase is not configured on the server.'
+        message: 'Database service is not configured'
       });
     }
 
+    // Validate and parse pagination query parameters
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 25));
+    const offset = (page - 1) * limit;
+
+    const { status, search } = req.query;
+
     let query = supabase
       .from('enquiries')
-      .select('*')
-      .order('created_at', { ascending: false });
+      .select('*', { count: 'exact' })
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
 
     if (status && status !== 'all') {
-      query = query.eq('status', status);
+      if (['pending', 'contacted'].includes(status)) {
+        query = query.eq('status', status);
+      }
     }
 
     if (search) {
-      query = query.or(`full_name.ilike.%${search}%,company_name.ilike.%${search}%,email.ilike.%${search}%,product_interest.ilike.%${search}%`);
+      const sanitized = sanitizeSearchParam(search);
+      if (sanitized.length > 0) {
+        query = query.or(
+          `full_name.ilike.%${sanitized}%,company_name.ilike.%${sanitized}%,email.ilike.%${sanitized}%,product_interest.ilike.%${sanitized}%`
+        );
+      }
     }
 
-    const { data, error } = await query;
+    const { data, count, error } = await query;
 
     if (error) {
       console.error('❌ Error fetching enquiries:', error.message);
-      return res.status(500).json({ success: false, error: error.message });
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to retrieve enquiries'
+      });
     }
 
-    res.json({ success: true, data });
+    const total = count || 0;
+    const hasNextPage = offset + limit < total;
+
+    return res.json({
+      success: true,
+      data: data || [],
+      pagination: {
+        page,
+        limit,
+        total,
+        hasNextPage
+      }
+    });
   } catch (err) {
     console.error('❌ Error in GET /api/enquiries:', err);
-    res.status(500).json({ success: false, error: 'Failed to fetch enquiries' });
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to retrieve enquiries'
+    });
   }
 });
 
-// 4. Admin Update Enquiry Status (PATCH /api/enquiries/:id/status) - Protected
-app.patch('/api/enquiries/:id/status', requireAdminAuth, async (req, res) => {
+// Admin: Update Enquiry Status (Protected)
+app.patch('/api/enquiries/:id/status', adminLimiter, requireAdminAuth, async (req, res) => {
   try {
     const { id } = req.params;
     const { status } = req.body;
 
+    if (!UUID_REGEX.test(id)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid enquiry ID format'
+      });
+    }
+
     if (!['pending', 'contacted'].includes(status)) {
       return res.status(400).json({
         success: false,
-        error: 'Invalid status value. Allowed: pending, contacted.'
+        message: 'Invalid status value. Allowed: pending, contacted'
       });
     }
 
     if (!supabase) {
-      return res.status(500).json({
+      return res.status(503).json({
         success: false,
-        error: 'Supabase is not configured on the server.'
+        message: 'Database service is not configured'
       });
     }
 
@@ -322,17 +530,50 @@ app.patch('/api/enquiries/:id/status', requireAdminAuth, async (req, res) => {
 
     if (error) {
       console.error('❌ Error updating enquiry status:', error.message);
-      return res.status(500).json({ success: false, error: error.message });
+      return res.status(500).json({
+        success: false,
+        message: 'Failed to update enquiry status'
+      });
     }
 
-    res.json({ success: true, data });
+    // Optional: Log administrative audit record
+    try {
+      await supabase.from('admin_audit_logs').insert([
+        {
+          admin_user_id: req.user.id,
+          action: 'UPDATE_STATUS',
+          entity_type: 'enquiry',
+          entity_id: id,
+          metadata: { new_status: status }
+        }
+      ]);
+    } catch (auditErr) {
+      console.warn('⚠️ Audit log insert non-critical failure:', auditErr.message);
+    }
+
+    return res.json({
+      success: true,
+      data
+    });
   } catch (err) {
     console.error('❌ Error in PATCH /api/enquiries/:id/status:', err);
-    res.status(500).json({ success: false, error: 'Failed to update enquiry status' });
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to update enquiry status'
+    });
   }
+});
+
+// Global Error Handler Middleware (Sanitizes error responses)
+app.use((err, req, res, next) => {
+  console.error('❌ Unhandled server error:', err.message);
+  res.status(err.status || 500).json({
+    success: false,
+    message: err.message || 'An internal server error occurred'
+  });
 });
 
 // Start Server
 app.listen(PORT, () => {
-  console.log(`🚀 Server listening on http://localhost:${PORT}`);
+  console.log(`🚀 Production-hardened server listening on http://localhost:${PORT}`);
 });
