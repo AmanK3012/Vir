@@ -177,7 +177,7 @@ export default function EnquiryFormDialog({
                   />
                 </div>
 
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div className="grid gap-2">
                     <Label htmlFor="enquiry-fullname">
                       Full Name <span className="text-[#ef4444]">*</span>
@@ -206,7 +206,7 @@ export default function EnquiryFormDialog({
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                   <div className="grid gap-2">
                     <Label htmlFor="enquiry-email">
                       Email Address <span className="text-[#ef4444]">*</span>
