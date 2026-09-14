@@ -13,15 +13,19 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const isProduction = process.env.NODE_ENV === 'production';
 
+// Enable trust proxy for reverse proxies (Render, Railway, Cloudflare, Nginx)
+// Required so express-rate-limit correctly identifies the client IP
+app.set('trust proxy', 1);
+
 // ==========================================================
-// 1. Security Headers (Helmet with Custom CSP)
+// 1. Security Headers (Helmet with Custom CSP & HSTS)
 // ==========================================================
 app.use(
   helmet({
     contentSecurityPolicy: {
       directives: {
         defaultSrc: ["'self'"],
-        scriptSrc: ["'self'", "'unsafe-inline'"],
+        scriptSrc: ["'self'"],
         styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
         fontSrc: ["'self'", "https://fonts.gstatic.com", "data:"],
         imgSrc: [
@@ -39,6 +43,13 @@ app.use(
         upgradeInsecureRequests: isProduction ? [] : null
       }
     },
+    hsts: isProduction
+      ? {
+          maxAge: 31536000,
+          includeSubDomains: true,
+          preload: true
+        }
+      : false,
     crossOriginEmbedderPolicy: false,
     crossOriginResourcePolicy: { policy: "cross-origin" }
   })
